@@ -73,4 +73,3 @@ streamlit run app.py
 
 - 웹 검색(`WebSearchTool`)은 Responses API를 지원하는 모델(`gpt-4.1`, `gpt-4o` 계열)이 필요합니다.
 - 대화 기록은 로컬 SQLite 파일(`coach_memory.db`)에 저장되며, 사이드바의 "Clear conversation" 버튼으로 초기화할 수 있습니다.
-- `.env`와 `coach_memory.db`는 `.gitignore`에 포함되어 있어 커밋되지 않습니다.
