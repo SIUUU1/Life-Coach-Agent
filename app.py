@@ -1,15 +1,54 @@
-## Life Coach Agent 
+## Life Coach Agent
 
 import os
 import uuid
+import base64
 import asyncio
 import tempfile
 import streamlit as st
 from openai import OpenAI
-from agents import Agent, Runner, WebSearchTool, FileSearchTool, SQLiteSession
+from agents import (
+    Agent,
+    Runner,
+    WebSearchTool,
+    FileSearchTool,
+    ImageGenerationTool,
+    SQLiteSession,
+)
 
 # SQLite file where the SDK stores conversation history across runs/restarts.
 DB_PATH = "coach_memory.db"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Known SDK/API quirk: when an image_generation_call item is stored in
+# session history and replayed on a later turn, the Responses API rejects
+# its "action" field with `Unknown parameter: 'input[N].action'`. The fix is
+# to strip that field from any image_generation_call items already saved in
+# this session before they're sent back to the API on the next turn.
+# ──────────────────────────────────────────────────────────────────────────
+async def repair_session_history(session: SQLiteSession) -> None:
+    """Remove the bad 'action' field from any past image_generation_call
+    items already stored in this session, so old turns stop poisoning new
+    requests. Safe to call every run; it's a no-op once history is clean."""
+    try:
+        items = await session.get_items()
+    except Exception:
+        return
+
+    changed = False
+    cleaned_items = []
+    for item in items:
+        item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+        if item_type == "image_generation_call" and isinstance(item, dict) and "action" in item:
+            item = {k: v for k, v in item.items() if k != "action"}
+            changed = True
+        cleaned_items.append(item)
+
+    if changed:
+        await session.clear_session()
+        if cleaned_items:
+            await session.add_items(cleaned_items)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -37,7 +76,7 @@ def run_async(coro):
 # ──────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Life Coach Agent", page_icon="🌱")
 st.title("🌱 Life Coach Agent")
-st.caption("An encouraging AI coach for motivation, self-improvement, and habits")
+st.caption("An encouraging AI coach: web search · goal files · image generation")
 
 # Life-coach persona (system instructions).
 # NOTE: the model is explicitly told to ALWAYS answer in Korean.
@@ -58,6 +97,14 @@ Guidelines:
 - Track progress over time: compare the user's stated goals with how things
   are going, and gently suggest next steps.
 - When you rely on search results, explain them in plain, easy language.
+- You can also CREATE IMAGES with the image_generation tool. Use it to draw:
+  (a) a goal-based VISION BOARD that collages the user's goals,
+  (b) a MOTIVATIONAL POSTER with a custom encouraging message, and
+  (c) a VISUAL of the user's progress (e.g. a celebratory image of a goal
+      they achieved). When a goal-based image is requested, first use
+      file_search to ground it in the user's real goals, optionally use
+      web_search for fresh ideas, then generate the image. Briefly say what
+      you're creating before generating it.
 - Remember the earlier conversation and keep coaching across turns.
 
 IMPORTANT: Always respond in Korean (한국어), in a friendly coaching tone.
@@ -70,7 +117,17 @@ IMPORTANT: Always respond in Korean (한국어), in a friendly coaching tone.
 # ──────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def create_agent(model: str, vector_store_id: str | None) -> Agent:
-    tools = [WebSearchTool(search_context_size="medium")]
+    tools = [
+        WebSearchTool(search_context_size="medium"),
+        # Hosted image generation -> vision boards, motivational posters, etc.
+        ImageGenerationTool(
+            tool_config={
+                "type": "image_generation",
+                "size": "1024x1024",
+                "quality": "medium",
+            }
+        ),
+    ]
     if vector_store_id:
         # Lets the coach search the user's uploaded goal documents.
         tools.append(
@@ -147,7 +204,25 @@ def format_tool_activity(result) -> str:
                 query = action.get("query")
             lines.append(f'> 🔍 웹 검색: "{query}"' if query else "> 🔍 웹 검색")
 
+        elif rtype == "image_generation_call":
+            lines.append("> 🎨 이미지 생성")
+
     return ("\n".join(lines) + "\n\n") if lines else ""
+
+
+def extract_generated_images(result) -> list[str]:
+    """Return base64-encoded PNGs produced by the image_generation tool."""
+    images: list[str] = []
+    for item in result.new_items:
+        raw = getattr(item, "raw_item", None)
+        if raw is None or getattr(raw, "type", None) != "image_generation_call":
+            continue
+        b64 = getattr(raw, "result", None)
+        if b64 is None and isinstance(raw, dict):
+            b64 = raw.get("result")
+        if b64:
+            images.append(b64)
+    return images
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -187,6 +262,7 @@ with st.sidebar:
             "OpenAI API Key",
             type="password",
             value=st.session_state.api_key,
+            placeholder="sk-...",
             help="Your key is kept only in this session's memory, not saved to disk.",
         )
         if st.button("Save API Key", use_container_width=True):
@@ -209,11 +285,16 @@ with st.sidebar:
     else:
         st.info("Enter your OpenAI API Key to start.")
 
-    # Hosted web/file search require a Responses-API-capable model.
+    # Hosted web/file/image search require a Responses-API-capable model.
+    # NOTE: gpt-4.1 (and image generation) may require an OpenAI "verified
+    # organization". gpt-4o / gpt-4o-mini usually work without verification,
+    # so gpt-4o is the default here.
     model = st.selectbox(
         "Model",
-        options=["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"],
+        options=["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"],
         index=0,
+        help="gpt-4.1 may need a verified OpenAI organization. "
+        "If you hit a 403 verification error, use gpt-4o.",
     )
 
     st.divider()
@@ -265,7 +346,10 @@ with st.sidebar:
 for msg in st.session_state.messages:
     avatar = "🌱" if msg["role"] == "assistant" else "🧑"
     with st.chat_message(msg["role"], avatar=avatar):
-        st.markdown(msg["content"])
+        if msg.get("content"):
+            st.markdown(msg["content"])
+        for b64 in msg.get("images", []):
+            st.image(base64.b64decode(b64))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -294,17 +378,43 @@ if prompt:
     agent = create_agent(model, st.session_state.vector_store_id)
 
     with st.chat_message("assistant", avatar="🌱"):
-        with st.spinner("Coaching and searching..."):
+        images: list[str] = []
+        with st.spinner("Coaching, searching, and creating..."):
             try:
+                # Clean up any previously-stored image_generation_call items
+                # that the API would otherwise reject on replay (see note above).
+                run_async(repair_session_history(session))
+
                 result = run_async(Runner.run(agent, prompt, session=session))
 
-                # Show file/web search activity first, like the example
+                # Show file/web/image activity first, like the example
                 activity = format_tool_activity(result)
                 display = activity + result.final_output
+                images = extract_generated_images(result)
             except Exception as e:
-                display = f"⚠️ Something went wrong: {e}"
+                msg = str(e)
+                if "must be verified" in msg or "Error code: 403" in msg:
+                    display = (
+                        "⚠️ 이 모델은 OpenAI 조직 인증이 필요해요.\n\n"
+                        "https://platform.openai.com/settings/organization/general "
+                        "에서 *Verify Organization*을 완료해 주세요 (반영까지 최대 15분).\n\n"
+                        f"원본 오류: {msg}"
+                    )
+                elif "unknown_parameter" in msg or "input[" in msg:
+                    display = (
+                        "⚠️ 이전 대화 기록에 호환되지 않는 데이터가 남아있어요.\n\n"
+                        "사이드바의 **Clear conversation** 버튼을 눌러 대화를 초기화한 뒤 "
+                        "다시 시도해 주세요.\n\n"
+                        f"원본 오류: {msg}"
+                    )
+                else:
+                    display = f"⚠️ Something went wrong: {msg}"
 
         st.markdown(display)
+        for b64 in images:
+            st.image(base64.b64decode(b64))
 
-    # (3) Store assistant output for re-rendering
-    st.session_state.messages.append({"role": "assistant", "content": display})
+    # (3) Store assistant output (text + any generated images) for re-rendering
+    st.session_state.messages.append(
+        {"role": "assistant", "content": display, "images": images}
+    )
